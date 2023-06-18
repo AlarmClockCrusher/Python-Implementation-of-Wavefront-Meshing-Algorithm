@@ -1,89 +1,67 @@
+from SortPolygonVerts_fromSTL import *
 from GenMesh_WaveFront import *
+import stl, time
+
+your_mesh = stl.mesh.Mesh.from_file('3DModel.stl')
+cs_tris = your_mesh.vectors
+
+func_height = 0.5
+ls_polies = getVecsPolies_splitConns_fromSTL(cs_tris, height=func_height)
+domain_3D, ls_domains_2D = create3DDomain_init2DBoundaries(ls_polies, func_height)
 
 
-arr_verts = genXYZarray(0, 12, 2, 0, 12, 2, 0, 12, 2)
+"""
+Plot meshed boundaries
+"""
+ax = plt.figure(dpi=100).add_subplot(projection="3d")
+ax.set(xlabel="x", ylabel="y", zlabel="z")
 
-nodes_total = []
-domain_3D = Domain_3D()
+i = 0
+for i, (domain, poly) in enumerate(zip(ls_domains_2D, ls_polies)):
+	cs, n_edges = npA([pt.coor for pt in poly.pts_split]), poly.n_edges
+	ax.quiver(*((cs + np.roll(cs, -1, axis=0)) / 2).T, *(0.1 * n_edges).T, color="red")
+	ax_plotPolygons(ax, [ele.coors for ele in domain.elements_2D])
+	for node in domain.nodes:
+		ax.scatter(*node.coor)
+		ax.text(*node.coor, node.i, color="orange")
+	normals = npA([ele.normal for ele in domain.elements_2D])
+	cs_cen = npA([ele.c_cen for ele in domain.elements_2D])
+	ax.quiver(*cs_cen.T, *(normals/4).T, color="green")
 
-for f in (lambda c: c[0] == 0, lambda c: c[0] == 12,
-			lambda c: c[1] == 0, lambda c: c[1] == 12,
-			lambda c: c[2] == 0, lambda c: c[2] == 12,
-		  ):
-	c_verts = arr_verts[[i for i, c in enumerate(arr_verts) if f(c)]]
-	c_verts, vecs_verts, normals = getVecs_ifCanFormConvexPolyPlane(c_verts)
-	cs, vecs, normals = splitConvexPoly(c_verts, vecs_verts, normals, 3)
-	faceNormal = getNormal_ofPlane(c_verts, normalize=True)
-	if faceNormal.dot(np.array([6, 6, 6]) - np.average(c_verts)) < 0:
-		faceNormal = -faceNormal
-	
-	domain = Domain_2D()
-	nodes, edges = [], []
-	for i, c in enumerate(cs):
-		if nd := next((nd for nd in nodes_total if not (nd.coor - c).any()), None):
-			nodes.append(nd)
-		else:
-			nodes.append(nd:=Node(domain, i, c))
-			nodes_total.append(nd)
-	for nd1, nd2 in zip(nodes, nodes[1:] + nodes[:1]):
-		if edge := nd1.sharesEdgewith(nd2): edges.append(edge)
-		else: edges.append(Edge(domain, nd1, nd2))
-	for edge, normal in zip(edges, normals): edge.normal = normal
-	
-	#ax_plotDots_Vecs_Normals(ax, cs, vecs, normals)
-	domain.prepare4Mesh(edges, nodes)
-	domain.genTriangleEle_Wavefront(4)
-	
-	#domain.plotAllEles(fig, ax, showLabel=True, size=8)
-	
-	for face in domain.elements_2D: face.normal = faceNormal
-	domain_3D.elements_2D += domain.elements_2D
-	domain_3D.nodes += domain.nodes
-	domain_3D.edges += domain.edges
+cs_triVerts = cs_tris.reshape(-1, 3)
+cs_max, cs_min = cs_triVerts.max(axis=0), cs_triVerts.min(axis=0)
+range_max, (x, y, z) = (cs_max - cs_min).max(), (cs_max + cs_min) / 2
+ax.set(xlim=(x-range_max/2, x+range_max/2),
+	   ylim=(y-range_max/2, y+range_max/2), zlim=(z-range_max/2, z+range_max/2))
 
-domain_3D.prepare4Mesh()
-
-try_catch = True
-if try_catch:
-	try:
-		domain_3D.genTetrahedronEle_Wavefront(1, maxIter=3)
-	except Exception as e: print("Error!", e)
-else: domain_3D.genTetrahedronEle_Wavefront(1, maxIter=3)
-
-fig = plt.figure()
-fig.set_size_inches(9, 4.5)
-
-def oneIncreGen(ax1, ax2, domain, height=3, explosionCenter=None):
-	try: domain.genTetrahedronEle_Wavefront(height, maxIter=1, maxNEle=1, reportSummary=True)
-	except Exception as e: print("Error!", e)
-	domain.update_activeFaces(ax1)
-	domain.update_elements(ax2, explosionCenter=explosionCenter)
-	
-gs = gridspec.GridSpec(1, 2)
-gs.update(left=0.05, right=0.95, bottom=0.1, top=0.95, wspace=0.15, hspace=0.14)
-ax = plt.subplot(gs[0, 0], projection="3d")
-ax1 = plt.subplot(gs[0, 1], projection="3d")
-ax.set_box_aspect((1, 1, 1))
-ax1.set_box_aspect((1, 1, 1))
-
-domain_3D.plotAllActiveFaces(fig, ax)
-domain_3D.plotAllEdges(ax, lw=0.4)
-
-
-domain_3D.plotAllElements(ax1, explosionCenter=npA([6, 6, 6]), explosionFactor=0.5)
-domain_3D.plotAllEdges(ax1, lw=0.4)
-
-btn_OneIncre = Button(ax=plt.axes([0.05, 0.02, 0.12, 0.04]), label="Incre 1", hovercolor="0.95")
-btn_OneIncre.on_clicked(lambda event: oneIncreGen(ax, ax1, domain_3D, explosionCenter=npA([6, 6, 6])))
-
-txt_face = TextBox(plt.axes([0.25, 0.02, 0.10, 0.05]), 'Face', initial='')
-btn_OneSearchFace = Button(ax=plt.axes([0.36, 0.02, 0.10, 0.04]), label="Search", hovercolor="0.95")
-def getFaceCoors(domain, s):
-	if f := next((f for f in domain.elements_2D if "{}".format(f) == s), None):
-		print("Found face:", f, "\n", (f.coors,))
-	else: print("Didn't find face. Check input")
-	
-btn_OneSearchFace.on_clicked(lambda event: getFaceCoors(domain_3D, txt_face.text))
-
-ax_Init(ax, widgets := [])
 plt.show()
+
+
+"""
+Generate tetra elements
+"""
+domain_3D.prepare4Mesh()
+#for f in domain_3D.elements_2D: f.normal = -f.normal
+
+t1 = time.time()
+try_catch, maxIter = True, 1
+if try_catch:
+	try: domain_3D.genTetrahedronEle_Wavefront(func_height, maxIter=maxIter)
+	except Exception as e: print("Error!", e)
+else: domain_3D.genTetrahedronEle_Wavefront(func_height, maxIter=maxIter)
+t2 = time.time()
+print("Done meshing. Time {}s".format(t2 - t1))
+
+
+"""
+Save the meshing information as pickle, for Blender viewing
+"""
+cs_tetras, idx_tetras = [], []
+for ele in domain_3D.elements_3D:
+	nds = list(ele.nodes)
+	cs_tetras.append(npA([nd.coor for nd in nds]))
+	idx_tetras.append([nd.i for nd in nds])
+ndCoors_idx = [(nd.coor, nd.i) for nd in domain_3D.nodes]
+
+with open("Saved_Domain_3D.pkl", 'wb') as file:
+	pickle.dump((cs_tetras, idx_tetras, ndCoors_idx), file)

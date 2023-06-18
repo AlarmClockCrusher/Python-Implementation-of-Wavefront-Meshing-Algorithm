@@ -1,60 +1,106 @@
 from GenMesh_WaveFront import *
-
-fig, ax = plt.subplots(dpi=200)
-fig.set_size_inches(3.2, 3.2)
-
-"""
-Create the coors, vecs, normals necessary for meshing boundaries
-"""
-
-#Circle. Permutation of many vertices could be slow. Here use predetermined order
-thetas = np.linspace(0, 2*np.pi, 22)[:-1]
-arr_verts = npA([0.6 * np.cos(thetas), 0.6 * np.sin(thetas)]).T
-cs, vecs, normals = splitConvexPoly(*getVecs_AlreadyConvexandSorted(arr_verts), 0.12)
-ax_plotDots_Vecs_Normals(ax, cs, vecs, normals)
-
-#A hole in the circle. The normals of a closed hole must point outward. Need to flip the inward normals
-thetas = np.linspace(0, 2*np.pi, 6)[:-1]
-arr_verts_new = npA([0.2 * np.cos(thetas), 0.3 * np.sin(thetas)]).T
-cs_new, vecs_new, normals_new = splitConvexPoly(*getVecs_AlreadyConvexandSorted(arr_verts_new), 0.12)
-normals_new = - normals_new
-ax_plotDots_Vecs_Normals(ax, cs_new, vecs_new, normals_new)
-
-#Square.
-#arr_verts = genXYarray(0, 1.2, 2, 0, 1.2, 2)
-#cs, vecs, normals = splitConvexPoly(*getVecs_ifCanFormConvexPolyPlane(arr_verts), 0.15)
-#ax_plotDots_Vecs_Normals(ax, cs, vecs, normals)
+from SortPolygonVerts_fromSTL import *
+import stl
 
 """
-Use the 
+Load STL model, either as 2D or 3D
+"""
+stl_mesh = stl.mesh.Mesh.from_file('2DModel.stl')
+dim, idx = checkif2D_getXYZIdx(stl_mesh) #[0, 1]: x-y plane, [0, 2]: x-z plane, [1, 2]: y-z plane, [0, 1, 2]: 3D
+
+#height = lambda c: 0.02 + 0.11*npNorm(c) #A variable meshing height
+height = 0.2
+
+cs_tris = stl_mesh.vectors[..., idx]
+ls_pts_onBoundaries, tris = extract_sort_verts_boundaries(cs_tris)
+ls_cs, ls_normals = getVecs_for1Plane_sortedOuterInner(ls_pts_onBoundaries, height=height)
+
+
+"""
+View ls_cs, ls_normals
+"""
+if dim == 2:
+	fig, ax = plt.subplots(dpi=100)
+	ax.set(xlabel="x", ylabel='y')
+else:
+	ax = plt.figure().add_subplot(projection="3d")
+	ax.set(xlabel="x", ylabel='y', zlabel='z')
+
+for pts in ls_pts_onBoundaries:
+	for pt in pts:
+		ax.text(*pt.coor, str(pt.i))#, ha="center", va="center")
+
+if dim == 2:
+	for cs_tri in cs_tris: ax.fill(*cs_tri.T, alpha=0.3)
+else: ax_plotPolygons(ax, cs_tris)
+
+for cs, normals in zip(ls_cs, ls_normals):
+	print(cs.shape, normals.shape)
+	ax.scatter(*cs.T, s=5)
+	if dim == 2:
+		for n, c1, c2 in zip(normals, cs, np.roll(cs, -1, axis=0)):
+			ax.arrow(*(c1+c2)/2, *n/15, head_width=0.02, color="red")
+	else:
+		print("Really")
+		ax.quiver(*((cs+np.roll(cs, -1, axis=0))/2).T, *(normals/8).T)
+
+print("Finished")
+plt.show()
+
+"""
+Mesh 2D
 """
 domain = Domain_2D()
-nodes = [Node(domain, i, c) for i, c in enumerate(cs)]
-edges = [Edge(domain, nd1, nd2) for nd1, nd2 in zip(nodes, nodes[1:]+nodes[:1])]
-for edge, normal in zip(edges, normals): edge.normal = normal
+ls_nodes, ls_edges, j = [], [], 0
+for cs in ls_cs:
+	ls_nodes.append([Node(domain, j + i, c) for i, c in enumerate(cs)])
+	j += len(ls_nodes)
+
+for nodes, normals in zip(ls_nodes, ls_normals):
+	edges = [Edge(domain, nd1, nd2) for nd1, nd2 in zip(nodes, nodes[1:] + nodes[:1])]
+	ls_edges.append(edges)
+	for edge, normal in zip(edges, normals): edge.normal = normal
+
+domain.prepare4Mesh([eg for edges in ls_edges for eg in edges], [nd for nodes in ls_nodes for nd in nodes])
+
+ax.scatter(*npA([nd.coor for nd in domain.nodes]).T)
+for nd in domain.nodes:
+	ax.text(*nd.coor, str(nd.i))
+if dim == 2: ax.set_aspect(1)
+plt.show()
 
 
-nodes_new = [Node(domain, i, c) for i, c in enumerate(cs_new)]
-edges_new = [Edge(domain, nd1, nd2) for nd1, nd2 in zip(nodes_new, nodes_new[1:]+nodes_new[:1])]
-for edge, normal in zip(edges_new, normals_new): edge.normal = normal
+try_catch, maxIter = True, 10
+if try_catch:
+	try: domain.genTriangleEle_Wavefront(height, maxIter=maxIter)
+	except Exception as e: print("Error!", e)
+else: domain.genTriangleEle_Wavefront(height, maxIter=maxIter)
 
 
-domain.prepare4Mesh(edges+edges_new, nodes+nodes_new)
-f_height = lambda c: 0.04 + 0.2*np.linalg.norm(c) #A variable meshing height
+try: domain.dissolveSmallTriangles(0.3)
+except Exception as e:
+	print("Error during dissolving")
+	
+	
+cs_tris, idx_tris = [], []
+for ele in domain.elements_2D:
+	nds = list(ele.nodes)
+	cs_tris.append(npA([nd.coor for nd in nds]))
+	idx_tris.append([nd.i for nd in nds])
+ndCoors_idx = [(nd.coor, nd.i) for nd in domain.nodes]
 
-#try_catch = True
-#if try_catch:
-#	try: domain.genTriangleEle_Wavefront(f_height, maxIter=9)
-#	except Exception as e: print("Error!", e)
-#else: domain.genTriangleEle_Wavefront(f_height, maxIter=9)
+with open("Saved_Domain_3D.pkl", 'wb') as file:
+	pickle.dump((cs_tris, idx_tris, ndCoors_idx), file)
+	
+	
+if dim == 2:
+	fig, ax = plt.subplots(dpi=100)
+	ax.tick_params("both")
+	for ele in domain.elements_2D: ax.fill(*ele.coors.T, alpha=0.3)
+else:
+	ax = (fig := plt.figure(dpi=100)).add_subplot(111, projection="3d")
+	ax_plotPolygons(ax, np.array([ele.coors for ele in domain.elements_2D]))
+for node in domain.nodes: ax.text(*node.coor, str(node.i))
 
-
-domain.dissolveSmallTriangles(0.3)
-
-domain.plotAllEles(fig, ax, showLabel=True, size=4)
-domain.plotAllNodes(ax, s=0.1)
-domain.textAllNodes(ax, size=4, color="red")
-domain.plotAllEdges(ax, lw=0.2)
-domain.plotAllEdges_Active(ax, lw=0.8)
-
+if dim == 2: ax.set_aspect(1)
 plt.show()

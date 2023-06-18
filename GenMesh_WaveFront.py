@@ -1,18 +1,22 @@
-from GeometryFuncs import *
+import numpy as np
 
+from GeometryFuncs import *
+import pickle
+from PlotMethods import *
+from CollisionDetection import *
 
 class Node:
 	def __init__(self, domain, i, coor):
 		self.i, self.coor = i, coor
 		self.edges, self.faces, self.volumes = set(), set(), set()
 		domain.nodes.append(self)
-	
+		
 	def __repr__(self): return "N%d" % self.i
 	
-	def sharesEdgewith(self, node):
-		if commonEdges := self.edges.intersection(node.edges): return next(iter(commonEdges))
-		else: return None
-
+	def edgeSharedwith(self, node):
+		return next(iter(self.edges & node.edges), None)
+		
+	@property
 	def nds_connectedbyEdge(self):
 		return {nd for eg in self.edges for nd in eg.nodes if nd is not self}
 	
@@ -20,224 +24,305 @@ class Edge:
 	def __init__(self, domain, *nodes):
 		self.nodes = nd1, nd2 = set(nodes)
 		self.coors = npA([nd1.coor, nd2.coor])
-		self.c_cen, self.radius = np.average(self.coors, axis=0), np.linalg.norm(nd1.coor-nd2.coor) / 2
+		self.c_cen, self.radius = np.average(self.coors, axis=0), npNorm(nd1.coor-nd2.coor) / 2
 		for nd in nodes: nd.edges.add(self)
-		self.faces, self.numFaces, self.facesMax = set(), 0, 2
+		self.faces, self.facesMax = set(), 2
 		self.normal = None
 		domain.edges.append(self)
+		self.domains = {domain}
 	
 	def __repr__(self):
 		n1, n2 = self.nodes
 		if n1.i < n2.i: return "E%d-%d" % (n1.i, n2.i)
 		else: return "E%d-%d" % (n2.i, n1.i)
+	
+	@property
+	def getVolumes(self): return {v for f in self.faces for v in f.volumes}
+	
+	@property
+	def isActive(self): return len(self.faces) < self.facesMax
+	
+	def angle_withEdge_deg(self, edge):
+		dotProd = ((normalSelf := self.normal) @ edge.normal).round(3)
+		angle = 180 - np.degrees(np.arccos(dotProd))
+		if (normalSelf @ (edge.c_cen - self.c_cen)).round(3) < 0:
+			return 360 - angle
+		return angle
 		
-
 class Ele_Triangle:
-	def __init__(self, domain, nodes, is2D=True):
+	def __init__(self, domain, nodes, calcFEAMatrices=False):
 		self.nodes, self.edges, self.volumes = set(nodes), set(), set()
-		if len(nodes) != 3: print("Num nodes wrong when gen triangle", nodes, self.nodes); raise Exception
-		domain.tups_eleNodes.append(self.nodes)
-		self.numVolumes, self.volumesMax = 0, 2
+		self.volumesMax = 2
 		self.coors = cs = npA([nd.coor for nd in nodes])
-		self.c_cen, self.radius = (c_cen:=np.average(cs, axis=0)), max(np.linalg.norm(cs-c_cen, axis=1))
-		self.area = abs(np.linalg.norm(np.cross(cs[1]-cs[0], cs[2]-cs[0]))) / 2
-		self.d_nd_to_angles = {nodes[i]: angle_between_3coors(nodes[i].coor, nodes[j].coor, nodes[k].coor)
-					   for i, j, k in ((0, 1, 2), (1, 2, 0), (2, 0, 1))}
-		self.ns_edge, self.normal = getNormals_OutofTriangle(cs, normalize=True)
+		self.c_cen, self.radius = (c_cen:=np.average(cs, axis=0)), max(npNorm(cs-c_cen, axis=1))
+		self.area = abs(npNorm(np.cross(*(cs[1:]-cs[0])))) / 2
+		self.d_nd_to_angles = {nodes[i]: angle_btw_2vecs(cs[j]-cs[i], cs[k]-cs[i])
+					   				for i, j, k in ([0, 1, 2], [1, 2, 0], [2, 0, 1])}
+		self.ns_edge, self.normal = getNormals_OutofTriangle(cs)
 		# Create edges or use existing edges. Those edges will record this triangle face.
 		for i in (0, 1, 2):
 			(n1, n2), n3 = (nodes[j] for j in (0, 1, 2) if j != i), nodes[i]
-			if edge := n1.sharesEdgewith(n2): self.edges.add(edge)
-			else:
-				self.edges.add(edge := Edge(domain, n1, n2))
-				if is2D: domain.edges_active.append(edge)
+			if edge := n1.edgeSharedwith(n2): self.edges.add(edge)
+			else: self.edges.add(edge := Edge(domain, n1, n2))
 			edge.normal = self.ns_edge[i]
 			edge.faces.add(self)
-		if is2D:
-			for edge in self.edges:
-				edge.numFaces += 1
-				if edge.numFaces >= edge.facesMax and edge in domain.edges_active:
-					domain.edges_active.remove(edge)  # print("Remove active edge from meshing", edge, "after removal, num of active edges:", len(domain.edges_active))
-			#print("\tAfter removal, edges_active:", domain.edges_active)
-		for nd in nodes: nd.faces.add(self)
+		for nd in nodes: nd.faces.add(self) #Used to count how many active faces a node has.
+		
+		self.dict_node_to_index = {nd: i for i, nd in enumerate(nodes)}
+		if calcFEAMatrices: self.initFEAMatrices()
+		else:
+			self.M_xy_2_xieta = self.M_inv = self.absdet_M_inv = None
+			self.arr_gradVi_gradVj_IntoverArea = self.arr_Vi_Vj_IntoverArea = None
+			self.dict_edgeIdx_to_arr_Vi_gradVj_IntoverEdge = self.dict_edgeIdx_to_arr_Vi_Vj_IntoverEdge = None
+			
+	def initFEAMatrices(self):
+		# Prepare for integration using linear functions
+		self.M_inv = M_inv = (self.coors[1:] - self.coors[0]).T
+		M, absdet_M_inv = self.M_xy_2_xieta, self.absdet_M_inv = np.linalg.inv(M_inv), abs(np.linalg.det(M_inv))
+		# For triangle element with linear functions, a tri can be linearly transformed into a right isosceles triangle.
+		# For right isosceles triangle in xi,eta, the 3 nodes define linear functions:
+		#	u0: 1-xi-eta (1 at origin), u1: xi (1 at (1, 0)), u2: eta (1 at (0, 1))
+		# The tri vert in real xy coor -> right isosceles tri is by c_xi_eta = M c_x_y
+		# grad_Vi_xyz = M.T @ grad_Ui_xieta
+			# grad{v0}_xy = (-a-c, c-d); grad{v1}_xy = (a, b); grad{v2}_xy = (c, d)
+		grads_v012_xy = npA([-M.sum(axis=0), *M])
+		self.arr_gradVi_gradVj_IntoverArea = 0.5 * absdet_M_inv * grads_v012_xy.dot(grads_v012_xy.T)
+		self.arr_Vi_Vj_IntoverArea = absdet_M_inv * (np.ones((3, 3)) + np.diag([1, 1, 1])) / 24
+		# The integrals of u0&u1&u2 products over triangle or along 01&02&12 are easy to calc
+		arr_Vi_Vj_01edge = npA([[2, 1, 0], [1, 2, 0], [0]*3]) / 6 * (coeff_01 := npNorm(M_inv[:, 0]))
+		arr_Vi_Vj_02edge = npA([[2, 0, 1], [0]*3, [1, 0, 2]]) / 6 * (coeff_02 := npNorm(M_inv[:, 1]))
+		arr_Vi_Vj_12edge = npA([[0]*3, [0, 2, 1], [0, 1, 2]]) / 6 * (coeff_12 := npNorm(M_inv[:, 1] - M_inv[:, 0]))
+		self.dict_edgeIdx_to_arr_Vi_Vj_IntoverEdge = {(0, 1): arr_Vi_Vj_01edge, (1, 0): arr_Vi_Vj_01edge,
+													   (1, 2): arr_Vi_Vj_12edge, (2, 1): arr_Vi_Vj_12edge,
+													   (0, 2): arr_Vi_Vj_02edge, (2, 0): arr_Vi_Vj_02edge}
+		# The integrals along 01&02&12 are most tricky
+		self.dict_edgeIdx_to_arr_Vi_gradVj_IntoverEdge = d = {}
+		M_T, grads_u_xieta, normals_xieta = M.T, npA([[-1, -1], [1, 0], [0, 1]]), npA([[0, -1], [-1, 0], [1/np.sqrt(2)]*2])
+		grads_v_xy_T, normals_xy_T = M_T @ grads_u_xieta.T, M_inv @ normals_xieta.T
+		normals_xy = (normals_xy_T / np.tile(npNorm(normals_xy_T, axis=0), (2, 1))).T
+		#M_inv @ normal_xieta --> normal_xy, length_xieta * coeff --> length_xy
+		for ind, (tup1, tup2, normal_xy, coeff) in enumerate(zip(((0, 1), (0, 2), (1, 2)), ((1, 0), (2, 0), (2, 1)),
+																	normals_xy, (coeff_01, coeff_02, coeff_12))):
+			(a := npA([0.5, 0.5, 0.5]))[2-ind] = 0 #along 01 edge, ui integrals are 1/2, 1/2, 0,  etc.
+			d[tup1] = d[tup2] = np.outer(a, coeff * normal_xy.dot(grads_v_xy_T))
 		
 	def __repr__(self):
 		n1, n2, n3 = self.nodes
 		i, j, k = sorted([n1.i, n2.i, n3.i])
 		return "F%d-%d-%d" % (i, j, k)
 
+	@property
 	def fs_connectedbyEdge(self):
 		return {f for eg in self.edges for f in eg.faces if f is not self}
 	
-	def sharesEdgewith(self, face):
-		if eg_common := self.edges.intersection(face.edges): return next(iter(eg_common))
-		else: return None
+	def edgeSharedwith(self, face): #Doesn't include those that touch this by just 1 node
+		return next(iter(self.edges & face.edges), None)
+		
+	@property
+	def isActive(self): return len(self.volumes) < self.volumesMax
+	
+	def angle_withFace_deg(self, face):
+		dotProd = ((normalSelf := self.normal) @ face.normal).round(3)
+		angle = 180 - np.degrees(np.arccos(dotProd))
+		if (normalSelf @ (face.c_cen - self.c_cen)).round(3) < 0:
+			angle = 360 - angle
+		return angle
 
 class Ele_Tetrahedron:
-	def __init__(self, domain, nodes):
+	def __init__(self, domain, nodes, calcFEAMatrices=False):
 		self.nodes, self.faces = set(nodes), set()
-		if len(nodes) != 4: print("Num nodes wrong when gen triangle", nodes, self.nodes); raise Exception
-		domain.tups_eleNodes.append(self.nodes)
 		self.coors = cs = npA([nd.coor for nd in nodes])
-		#print("Creating tetra from nodes", nodes, "\n", cs)
-		self.c_cen, self.radius = (c_cen := np.average(self.coors, axis=0)), max(np.linalg.norm(cs - c_cen, axis=1))
-		self.volume = volume_between_3vecs(*(cs[1:] - cs[0]))
-		normals = getNormals_OutofTetra(cs, normalize=True)
+		self.c_cen, self.radius = (c_cen := np.average(self.coors, axis=0)), max(npNorm(cs - c_cen, axis=1))
+		v01, v02, v03 = cs[1:] - cs[0]
+		self.volume = abs(v01.dot(np.cross(v02, v03))) / 6
+		normals = getNormals_OutofTetra(cs)
 		# Create edges or use existing edges. Those edges will record this triangle face.
 		for i in (0, 1, 2, 3):
 			(n1, n2, n3), n4 = (nodes[j] for j in (0, 1, 2, 3) if j != i), nodes[i]
-			if faces := n1.faces.intersection(n2.faces).intersection(n3.faces):
+			if faces := n1.faces & n2.faces & n3.faces:
 				self.faces.add(face := next(iter(faces)))
-				#print("Using a face already existing", faces)
+				#print("\t\tUsing an existing face", face)
 			else:
-				self.faces.add(face := Ele_Triangle(domain, [n1, n2, n3], is2D=False))
-				print("\tAdd active face", face)
-				domain.elements_2D_active.append(face)
+				self.faces.add(face := Ele_Triangle(domain, [n1, n2, n3]))
+				#print("\t\tAdd active face", face, face.isActive)
 				domain.elements_2D.append(face)
 			face.normal = normals[i]
-			#face.normal = getNormal_arr4Coor_PerptoC0(npA([n4.coor, n1.coor, n2.coor, n3.coor]))
 			face.volumes.add(self)
-		for face in self.faces:
-			face.numVolumes += 1
-			# print("Check face {} and its numVolumes {}/{}".format(face, face.numVolumes, face.volumesMax))
-			if face.numVolumes >= face.volumesMax and face in domain.elements_2D_active:
-				print("\t\tRemove active face", face)
-				domain.elements_2D_active.remove(face)
-		print("After check, faces_active:", len(domain.elements_2D_active), len(domain.elements_2D))
 		for nd in nodes: nd.volumes.add(self)
-	
+		
+		self.dict_node_to_index = {nd: i for i, nd in enumerate(nodes)}
+		if calcFEAMatrices: self.initFEAMatrices()
+		else:
+			self.M_xy_2_xieta = self.M_inv = self.absdet_M_inv = None
+			self.arr_gradVi_gradVj_IntoverVolume = self.arr_Vi_Vj_IntoverVolume = None
+			self.dict_faceIdx_to_arr_Vi_gradVj_IntoverFace = self.dict_faceIdx_to_arr_Vi_Vj_IntoverFace = None
+			
 	def __repr__(self):
 		n1, n2, n3, n4 = self.nodes
 		i, j, k, l = sorted([n1.i, n2.i, n3.i, n4.i])
 		return "V%d-%d-%d-%d" % (i, j, k, l)
 
-
+	@property
+	def getEdges(self): return {eg for f in self.faces for eg in f.edges}
+	
+	def initFEAMatrices(self):
+		# Prepare for integration using linear functions
+		#Tetra can be transformed into one defined by xi, eta, rou axis
+			#In xi,eta,rou the 4 nodes define linear functions:  u0: 1-xi-eta-rou (1 at origin), u1: xi (1 at (1, 0, 0)), u2: eta (1 at (0, 1, 0)), u3: rou (1 at (0, 0, 1))
+			#grad_u0 = (-1, -1, -1), grad_U1 = (1, 0, 0), grad_U2 = (0, 1, 0), grad_U3 = (0, 0, 1)
+			#The tetra vert in real xy coor -> xi, eta, rou is by c_xi_eta_rou = M c_x_y_z
+		self.M_inv = M_inv = (self.coors[1:] - self.coors[0]).T
+		M, absdet_M_inv = self.M_xy_2_xieta, self.absdet_M_inv = np.linalg.inv(M_inv), abs(np.linalg.det(M_inv))
+		# grad_Vi_xyz = M.T @ grad_Ui_xietarou
+		grads_v0123_xyz = npA([-M.sum(axis=0), *M])
+		self.arr_gradVi_gradVj_IntoverVolume = absdet_M_inv / 6 * grads_v0123_xyz.dot(grads_v0123_xyz.T)
+		self.arr_Vi_Vj_IntoverVolume = absdet_M_inv * (np.ones((4, 4)) + np.diag([1, 1, 1, 1])) / 120
+		# The integrals of u0&u1&u2 products over triangle faces are easy to calc
+		arr_Vi_Vj_012face = npA([[2, 1, 1, 0], [1, 2, 1, 0], [1, 1, 2, 0], [0]*4]) / 24 * (coeff_012 := npNorm(np.cross(M_inv[:,0], M_inv[:,1])))
+		arr_Vi_Vj_013face = npA([[2, 1, 0, 1], [1, 2, 0, 1], [0]*4, [1, 1, 0, 2]]) / 24 * (coeff_013 := npNorm(np.cross(M_inv[:,0], M_inv[:,2])))
+		arr_Vi_Vj_023face = npA([[2, 0, 1, 1], [0]*4, [1, 0, 2, 1], [1, 0, 1, 2]]) / 24 * (coeff_023 := npNorm(np.cross(M_inv[:,1], M_inv[:,2])))
+		arr_Vi_Vj_123face = npA([[2, 0, 1, 1], [0]*4, [1, 0, 2, 1], [1, 0, 1, 2]]) / 24 * (coeff_123 := npNorm(np.cross(*(M_inv[:,1:].T-M_inv[:,0]))))
+		self.dict_faceIdx_to_arr_Vi_Vj_IntoverFace = {t: arr for arr, tup in zip((arr_Vi_Vj_012face, arr_Vi_Vj_013face, arr_Vi_Vj_023face, arr_Vi_Vj_123face),
+																					((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)))
+													   				for t in permutations(tup)}
+		# The integrals along 012&013&023&123 are most tricky
+		self.dict_faceIdx_to_arr_Vi_gradVj_IntoverFace = d = {}
+		M_T, grads_u_xieta = M.T, npA([[-1, -1, -1], [1, 0, 0], [0, 1, 0], [0, 0, 1]])  # 012&013&023&123
+		normals_xieta = npA([[0, 0, -1], [0, -1, 0], [-1, 0, 0], [1 / np.sqrt(3)] * 3])  # 012&013&023&123
+		grads_v_xy_T, normals_xy_T = M_T @ grads_u_xieta.T, M_inv @ normals_xieta.T
+		normals_xy = (normals_xy_T / np.tile(npNorm(normals_xy_T, axis=0), (3, 1))).T
+		for ind, (tup, normal_xy, coeff) in enumerate(zip(((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)),
+														  normals_xy, (coeff_012, coeff_013, coeff_023, coeff_123))):
+			(a := npA([1, 1, 1, 1])/6)[3 - ind] = 0  # along 01 edge, ui integrals are 1/2, 1/2, 0,  etc.
+			arr = np.outer(a, coeff * normal_xy.dot(grads_v_xy_T))
+			for t in permutations(tup): d[t] = arr
+			
 # 如果希望用提前生成的节点的方法来确定元素，则应该尽量先从边界下手，生成所有边界的edge。这些edge只能包含1个2个面元素
 # 然后生成2维面划分过程中，每个已有的edge都寻找一个离自己中点最近，且不会产生与其他已有元素相切割的节点。同时需要一个方法来确定节点不可以与生成方向有冲突。
 class Domain_2D:
 	def __init__(self):
-		self.nodes, self.elements_2D, self.edges, self.edges_active = [], [], [], []
-		self.arr_coors = None
+		self.nodes, self.elements_2D, self.edges = [], [], []
 		self.tups_eleNodes = []
-		self.patches = []
 		
 	def prepare4Mesh(self, edges, nodes):
-		for edge in edges: edge.facesMax, edge.faces = 1, set()
-		self.edges, self.edges_active, self.nodes = edges, edges[:], nodes
+		for edge in edges: edge.facesMax = 1 #Don't touch edge.faces, edges shared by two domains.
+		self.edges, self.nodes = edges, nodes
 		for i, nd in enumerate(self.nodes): nd.i = i
-		self.arr_coors = npA([nd.coor for nd in self.nodes])
-		print("\n\n\n\nBefore starting 2D meshing of domain. Edges must all be boundaries. Total faces: {}, active faces {}".format(len(self.edges), len(self.edges_active)))
-		print("All starting edges must have 1 facesMax:", all(e.facesMax == 1 for e in self.edges_active), all(e.facesMax == 1 for e in self.edges))
-		print("All nodes must correctly know the edges they have:", [(nd.i, len(nd.edges)) for nd in nodes])
+		for eg in self.edges:
+			eg.domains.add(self)
+			eg.facesMax = 1
+		print("\n\nBefore starting 2D meshing of domain. Edges must all be boundaries")
+		print("Total edges: {}, active edges {}".format(len(self.edges), sum(eg.isActive for eg in self.edges)))
 		print("Nodes: ", len(nodes))
 		
-	def getEdges_cutby_face(self, coors3):
-		c_new_cen = np.average(coors3, axis=0)#.round(DIGIT_ACCU)
-		r = max(np.linalg.norm(coors3 - c_new_cen, axis=1))
-		return [eg for eg in self.edges if twoCoorsClose(c_new_cen, eg.c_cen, r+eg.radius) and check_segmentMeets_3CoorFace(*eg.coors, coors3)[0]]
-		
-	def face_cuts_anyEdge(self, coors3):
-		c_new_cen = np.average(coors3, axis=0)#.round(DIGIT_ACCU)
-		r = max(np.linalg.norm(coors3 - c_new_cen, axis=1))
-		return any(twoCoorsClose(c_new_cen, eg.c_cen, r + eg.radius) and check_segmentMeets_3CoorFace(*eg.coors, coors3)[0] for eg in self.edges)
+	def tri_cuts_anySeg(self, coors3, cs_edges=None):
+		if cs_edges is None: cs_edges = npA([eg.coors for eg in self.edges])
+		return check_Tri_cuts_Segs(coors3, cs_edges)
 	
-	def face_cuts_anyElement(self, coors3):
-		c_new_cen = np.average(coors3, axis=0)#.round(DIGIT_ACCU)
-		r = max(np.linalg.norm(coors3 - c_new_cen, axis=1))
-		return any(twoCoorsClose(c_new_cen, ele.c_cen, r+ele.radius) and check_2Triangles_CutEachOther(coors3, ele.coors) for ele in self.elements_2D)
-	
-	def genTriangleEle_Wavefront(self, f_height, maxIter=10):
-		num = 0
-		check_2SegmentsMeet = check_2SegmentsIntersect_within_3D if len(self.nodes[0].coor) == 3 else check_2SegmentsIntersect_within_2D
-		while edges := self.edges_active:
-			if num >= maxIter: break
-			print("*******\nIteration %d\n********" % num)
-			print("Num of active edges", len(edges), edges)
-			for edge in edges[:]:
-				if edge not in self.edges_active: continue
-				print("\nTry to grow from active edge", edge)
-				n1, n2 = ownNodes = edge.nodes
-				c1, c2 = n1.coor, n2.coor
-				node_new, nodes, c_cen, normal = None, self.nodes, edge.c_cen, edge.normal
-				height = f_height(c_cen) if callable(f_height) else f_height
-				#Check if there is a triangle patch that closes void
-				node_new = self.search_4edgesClosing(edge)
-				#if not node_new: node_new = self.search_smallAnglebetween2Planes(edge)
-				# If there is existing node that is very close and forms a large angle from the edge and won't cause intersection, then use it
-				if not node_new: node_new = self.search_nearbyNodes(edge, height)
-				#Generate a new coor. If it's lying outside domain or in existing element, then skip this edge and leave it to next iteration
-				if not node_new:
-					coors_triang_new = npA([c1, c2, c_new:= (c_cen + normal * height)])
-					print("Potential new location from edge {} is:".format(edge), c_new, "\n", (edge.coors,))
-					#欲生成新三角形，需要先检测其是否与已有的edge相重叠（自己的底边会被认为不发生重叠）。如没有，则可以直接生成；如果有，则找到所有有重叠的edge，然后找这些edge中最靠近底边的节点。
-						#尝试用靠近底边的节点生成三角形，然后看其是否会产生与其他edge的重叠。如果有，则尝试距离稍远的节点。
-					if edgesCut := self.getEdges_cutby_face(coors_triang_new):
-						nds_fromEdgesCut = list({nd for ele in edgesCut for nd in ele.nodes if nd} - ownNodes)
-						#print("New tri hits existing edges:", nds_fromEdgesCut)
-						arr_d_toEdge = normal.dot((npA([nd.coor for nd in nds_fromEdgesCut]) - c_cen).T).round(DIGIT_ACCU)
-						for i in arr_d_toEdge.argsort():
-							if arr_d_toEdge[i] <= 0: continue
-							nd0 = nds_fromEdgesCut[i]
-							if not self.face_cuts_anyEdge(npA([c1, c2, nd0.coor])):
-								print("Pick a node within the potential new triangle to form", nd0)
-								node_new = nd0; break
-					else:
-						node_new = Node(self, len(nodes), c_new)
-						print("Use the new node")
-				if node_new:
-					print("Generate a triangle", edge, node_new)
-					self.elements_2D.append(Ele_Triangle(self, [node_new, n1, n2]))
-				else: print("Failed to grow edge:", edge, edge.coors)
-			num += 1
-		
-		print("Number of elements_2D created:", len(self.elements_2D), "Total area:", round(sum(ele.area for ele in self.elements_2D), DIGIT_ACCU))
-		print("Nodes in domain: {}. Edges in domain: {}".format(len(self.nodes), len(self.edges)))
-		print("Total number of faces", len(self.elements_2D))
-		print("Boundary faces", sum(len(face.volumes) == 1 for face in self.elements_2D))
-	
-	def search_4edgesClosing(self, edge):
-		nodes, normal, ownNodes, c_cen = self.nodes, edge.normal, edge.nodes, edge.c_cen
-		nds_nextto_1, nds_nextto_2 = [nd.nds_connectedbyEdge() for nd in ownNodes]
-		if nds_cmn := [nd for nd in nds_nextto_1.intersection(nds_nextto_2) 
-					   if nd in nodes and {nd}|ownNodes not in self.tups_eleNodes]:
-			arr_d_toEdge = normal.dot(npA([nd.coor - c_cen for nd in nds_cmn]).T)
-			for i in arr_d_toEdge.argsort(): # There can be multiple nodes that can connect to both ends of edge. Pick the closest one in right direction
-				if arr_d_toEdge[i] <= 0: continue
-				else:
-					print("Use existing 3 nodes for triangle. Closing:", edge, nds_cmn[i])
-					return nds_cmn[i]
-	
-	def search_smallAnglebetween2Planes(self, edge):
-		c_cen, normal, ownNodes = edge.c_cen, edge.normal, edge.nodes
+	def getEdges_cutby_tri(self, coors3, cs_edges=None):
 		edges = self.edges
-		if egs := [eg for nd in ownNodes for eg in nd.edges
-				   if eg is not edge and eg in edges and normal.dot(eg.c_cen - c_cen).round(DIGIT_ACCU) > 0 and normal.dot(eg.normal) < -0.1]:
-			nds = [next(iter(eg.nodes - ownNodes)) for eg in egs]
-			arr_d_toedge = npA([normal.dot(nd.coor - c_cen) for nd in nds])
-			for i in arr_d_toedge.argsort():
-				#print("Check if can gen using a two edges", edge, nds[i])
-				if not self.face_cuts_anyEdge(npA([*edge.coors, (nd := nds[i]).coor])):
-					print("Connect to another edge's dot", edge, nd)
-					return nd
+		if cs_edges is None: cs_edges = npA([eg.coors for eg in edges])
+		return [edges[i] for i in check_Tri_cuts_Segs(coors3, cs_edges, any_not_idx=False)]
+		
+	def genTriangleEle_Wavefront(self, func_height, maxIter=10):
+		numIter = 0
+		while (edges_curFront := [eg for eg in self.edges if eg.isActive]) and numIter < maxIter:
+			nds_curFront = {nd for eg in edges_curFront for nd in eg.nodes}
+			print("*******\nIteration %d\n********" % numIter)
+			print("Num of active edges", len(edges_curFront))
+			for edge in edges_curFront:
+				if not edge.isActive: continue
+				print("\nTry to grow from active edge", edge, edge.normal)
+				height = func_height(edge.c_cen) if callable(func_height) else func_height
+				cs_edges = npA([eg.coors for eg in self.edges])
+				if not (node_new := self.try_nearbyNodes(edge, height, cs_edges)):
+					node_new = self.try_budEle_Height(edge, height, cs_edges)
+				if not node_new:
+					print("Failed to gen a tetra from face", edge)
+					raise RuntimeError
+				else:
+					ele = self.genaTriElement([node_new, *edge.nodes])
+					print("Genned a tetra", ele, "with", node_new, ". New ele area:", ele.area)
+			
+			for nd in nds_curFront:
+				if sum(eg.isActive for eg in nd.edges) == 2:
+					height = func_height(nd.coor) if callable(func_height) else func_height
+					print("\nTry to close up nd space", nd, [eg for eg in nd.edges if eg.isActive], height)
+					self.try_closeupSpacearound(nd, height)
+			numIter += 1
+			
+		print("Finished meshing 2D domain.\nTotal faces:", len(self.elements_2D),
+			  "Total area:", round(sum(ele.area for ele in self.elements_2D), DIGIT_HEIGHT))
+		print("Total nodes: {}. Total edges: {}".format(len(self.nodes), len(self.edges)))
+		
+	def genaTriElement(self, nodes):
+		if not isinstance(nodes, list): nodes = list(nodes)
+		self.elements_2D.append(ele := Ele_Triangle(self, nodes))
+		return ele
 	
-	def search_nearbyNodes(self, edge, height):
+	def try_closeupSpacearound(self, node, height):
+		if egs := [eg for eg in node.edges if eg.isActive and self in eg.domains]:
+			while egs:
+				nd_other_2 = next(iter((eg2 := egs[1]).nodes - (eg1 := egs[0]).nodes))
+				largeAngle = eg1.angle_withEdge_deg(eg2) > 100
+				#夹角<100度时，直接尝试连接nd_other1&nd_other2。如果其不与其他edge切割时，直接生成；若有切割，则取这些edge的node中最接近轴线的node
+				#夹角>100度时，由eg1的height bud tri。这些tri绝不会与eg2切割。若无切割，则生成；若无切割，则取nodes
+				if not (node_new := self.try_budEle_Height(eg1, height, cs_edges=npA([eg.coors for eg in self.edges]),
+												preferNode=None if largeAngle else nd_other_2)):
+					print("Wrong while closing node", node)
+					raise RuntimeError
+				ele = self.genaTriElement([node_new, *eg1.nodes])
+				print("Genned a tri ele {} while closing {}".format(ele, node))
+				egs = [eg2, next(iter(egs))] if (egs := {eg for eg in node.edges if eg.isActive and self in eg.domains} - {eg2}) else []
+				
+	def try_nearbyNodes(self, edge, height, cs_edges,
+						lateral=0.52, vertical_min=0.5, vertical_max=1.2):
+		nodes, normal, cs_eg, dim = self.nodes, edge.normal, edge.coors, len(edge.normal)
+		vs_cen2Nodes = npA([nd.coor for nd in nodes]) - edge.c_cen  # shape(n, 3)
+		heights_fromface = (normal @ vs_cen2Nodes.T)
+		horDist_fromCen = npNorm(np.cross(normal, vs_cen2Nodes), axis=1) if dim == 3 else np.abs(np.cross(normal, vs_cen2Nodes))
+		dist_fromCen, maxHorDist = npNorm(vs_cen2Nodes, axis=1), lateral * height
+		idx_allowed = np.where((vertical_min * height < heights_fromface) & (heights_fromface < vertical_max * height) & (horDist_fromCen < maxHorDist))[0]
+		nodes_ds = sorted(((nodes[i], dist_fromCen[i]) for i in idx_allowed), key=lambda tup: tup[1])
+		return next((nd for nd, _ in nodes_ds if not self.tri_cuts_anySeg(npA([*cs_eg, nd.coor]), cs_edges=cs_edges)), None)
+		
+	def try_budEle_Height(self, edge, height, cs_edges, preferNode=None, largerHeight_2Try=1.2):
 		nodes, normal, c_cen, ownNodes = self.nodes, edge.normal, edge.c_cen, edge.nodes
-		arr_d = np.linalg.norm(arr_vecs := npA([nd.coor for nd in nodes]) - c_cen, axis=1)
-		for i in arr_d.argsort():
-			if arr_d[i] > 1.3 * height: break
-			elif (nd := nodes[i]) in ownNodes: continue
-			elif normal.dot(arr_vecs[i]) > np.linalg.norm(arr_vecs[i]) / 4:
-				if not self.face_cuts_anyEdge(npA([*edge.coors, nd.coor])):
-					print("Connect to a nearby node", nd)
-					return nd
-					
-	def removeaNode(self, node, nds_outer):
-		nds012 = nds230 = []
+		c1, c2 = edge.coors  # (n1, n2) = ownNodes
+		if preferNode: cs_tri_new = npA([c1, c2, preferNode.coor])
+		else: cs_tri_new = npA([c1, c2, c_cen + largerHeight_2Try * normal * height])
+		# 欲生成新三角形，需要先检测其是否与已有的edge相重叠（自己的底边会被认为不发生重叠）。如没有，则可以直接生成
+		# 如果有，则找这些有重叠的edge的端点，取其中最靠近轴线的端点，尝试生成三角形，并检测它们是否不与已有的edge相重叠。
+		if edgesCut := self.getEdges_cutby_tri(cs_tri_new, cs_edges):
+			print("Collided with edges:", edgesCut)
+			nds_fromEdgesCut = list({nd for ele in edgesCut for nd in ele.nodes if nd} - ownNodes)
+			vs_cen_to_nds = npA([nd.coor for nd in nds_fromEdgesCut]) - c_cen
+			cosines_from_normal = (normal.dot(vs_cen_to_nds.T) / npNorm(vs_cen_to_nds, axis=1)).round(DIGIT_HEIGHT)
+			nds_cosines = sorted(zip(nds_fromEdgesCut, cosines_from_normal), key=lambda t: t[1], reverse=True)
+			return next((nd for nd, cosine in nds_cosines if cosine > 0 and not self.tri_cuts_anySeg(npA([c1, c2, nd.coor]), cs_edges)), None)
+		elif preferNode:
+			print("Bud with existing node", preferNode)
+			return preferNode
+		else:
+			print("Bud with new node")
+			return Node(self, len(nodes), c_cen + normal * height)
+	
+	"""Dissolve triangles that are too small"""
+	def dissolveaNode(self, node, nds_outer):
+		print("Dissolving node:", node, node.coor, "nds_outer", nds_outer)
+		nds021 = nds023 = []
+		faces_2remove = node.faces
 		if len(nds_outer) == 4:
-			cs, vecs, normals = getVecs_ifCanFormConvexPolyPlane(npA([nd.coor for nd in list(nds_outer)]))
-			if np.linalg.norm(cs[2]-cs[0]) < np.linalg.norm(cs[3]-cs[1]): cs1, cs2 = cs[:3], cs[[2, 3, 0]]
-			else: cs1, cs2 = cs[[0, 1, 3]], cs[1:]
-			nds012, nds230 = [nd for nd in nds_outer if not (cs1-nd.coor).any(axis=1).all()], [nd for nd in nds_outer if not (cs2-nd.coor).any(axis=1).all()]
+			nds_orderd = [nd1 := next(iter(nds_outer))]
+			while nd1 := next((nd for nd in nds_outer if not nd.edges.isdisjoint(nd1.edges) and nd not in nds_orderd), None):
+				nds_orderd.append(nd1)
+			if npNorm(nds_orderd[2].coor - nds_orderd[0].coor) < npNorm(nds_orderd[3].coor - nds_orderd[1].coor):
+				idx_021, idx_023 = (0, 2, 1), (0, 2, 3)
+			else: idx_021, idx_023 = (1, 3, 0), (1, 3, 2)
+			nds021, nds023 = [nds_orderd[i] for i in idx_021], [nds_orderd[i] for i in idx_023]
+			print("Will gen two triangles:", nds021, nds023)
+		for eg in {eg for f in node.faces for eg in f.edges if eg not in node.edges}:
+			eg.faces -= faces_2remove
 		for f in node.faces:
 			self.elements_2D.remove(f)
 			self.tups_eleNodes.remove(f.nodes)
@@ -246,305 +331,319 @@ class Domain_2D:
 			for nd in nds_outer:
 				if eg in nd.edges: nd.edges.remove(eg)
 		for nd in nds_outer:
-			for f in node.faces:
-				if f in nd.faces: nd.faces.remove(f)
+			nd.faces -= faces_2remove
 		self.nodes.remove(node)
 		if len(nds_outer) == 3: self.elements_2D.append(Ele_Triangle(self, list(nds_outer)))
-		if nds012: #Split the quadrilateral into two, using the shorter diagonal
-			self.elements_2D.append(Ele_Triangle(self, nds012))
-			self.elements_2D.append(Ele_Triangle(self, nds230))
+		if nds021: #Split the quadrilateral into two, using the shorter diagonal
+			self.elements_2D.append(Ele_Triangle(self, nds021))
+			self.elements_2D.append(Ele_Triangle(self, nds023))
 			
 	def dissolveSmallTriangles(self, height):
 		area_min = height ** 2 / 2
-		for ele in self.elements_2D:
-			if ele.area < area_min:
-				for nd in (nds:=ele.nodes):
+		self.tups_eleNodes = [f.nodes for f in self.elements_2D]
+		for ele in self.elements_2D[:]:
+			if ele in self.elements_2D and ele.area < area_min:
+				for nd in ele.nodes:
 					if len(nd.edges) in (3, 4) and not any(eg.facesMax == 1 for eg in nd.edges) and ele.d_nd_to_angles[nd] > 110 \
 							and all(f.nodes in self.tups_eleNodes for f in nd.faces):
-						print("Found a node to remove", len(nd.edges), nd, nd.nds_connectedbyEdge())
-						self.removeaNode(nd, nd.nds_connectedbyEdge())
+						print("Found {} with {} edges to remove".format(nd, len(nd.edges)), nd.nds_connectedbyEdge)
+						self.dissolveaNode(nd, nd.nds_connectedbyEdge)
 						break
-						
-	def plotAllEles(self, fig, ax, showLabel=False, size=1):
-		dim = len(self.nodes[0].coor)
-		fig.canvas.mpl_connect("button_press_event", lambda event: self.mouseClicked(ax, event))
-		for i, ele in enumerate(self.elements_2D):
-			if dim == 2: self.patches.append(ax.fill(*ele.coors.T, alpha=0.2)[0])
-			else: self.patches.append(ax_plotPolygons(ax, [ele.coors], alpha=0.2))
-			ax.text(*np.average(ele.coors, axis=0), i, size=size,
-					horizontalalignment="center", verticalalignment="center")
-	
-	def mouseClicked(self, ax, event):
-		if event.inaxes == ax and (patch := next((patch for patch in self.patches if patch.contains(event)[0]), None)):
-			ele = self.elements_2D[(i:=self.patches.index(patch))]
-			print("Triangle:", i, ele)
-			
-	def plotAllEdges(self, ax, lw):
-		for edge in self.edges: ax.plot(*edge.coors.T, lw=lw)
-	
-	def plotAllEdges_Active(self, ax, lw):
-		for edge in self.edges_active: ax.plot(*edge.coors.T, lw=lw)
 		
-	def plotAllNodes(self, ax, *args, **kwargs):
-		ax.scatter(*npA([nd.coor for nd in self.nodes]).T, *args, **kwargs)
+	"""Given pre-determined nodes, try to form triangular elements among those nodes"""
+	def saveMesh(self, filename="2D_Mesh.txt"):
+		with open(filename, 'w') as fout:
+			fout.write("Nodes:\n")
+			for nd in self.nodes:
+				nd.coor = nd.coor.round(DIGIT_HEIGHT)
+				fout.write(("{}, [{},{}]\n" if len(nd.coor) == 2 else "{}, [{},{},{}]\n").format(nd.i, *nd.coor))
+			fout.write("Faces:\n")
+			for face in self.elements_2D:
+				n1, n2, n3 = face.nodes
+				fout.write("{},{},{}\n".format(n1.i, n2.i, n3.i))
+				
+	def loadMesh(self, filename="2D_Mesh.txt"):
+		with open(filename, 'r') as fin:
+			i = (lines := fin.readlines()).index("Faces:\n")
+			lines_nodes, lines_faces = lines[1:i], lines[i + 1:]
+			nodes, elements_2D = self.nodes, self.elements_2D = [], []
+			for i, l in enumerate(lines_nodes):
+				exec("Node(self, {}, np.array({}))".format(i, l[l.index(',') + 1:].strip("\n")))
+			print("Nodes in mesh:\n", nodes)
+			for l in lines_faces:
+				i0, i1, i2 = l.strip("\n").split(',')
+				i0, i1, i2 = int(i0), int(i1), int(i2)
+				elements_2D.append(Ele_Triangle(self, [nodes[i0], nodes[i1], nodes[i2]], calcFEAMatrices=True))
+			print("Triangles in mesh:\n", elements_2D)
+	
+	"""Calculate matrices neccesary for FEA."""
+	def getArr_scalarProducts_IntoverArea_Linear(self, ViVj_not_gradVigradVj=False):
+		arr = np.zeros([n:=len(self.nodes)] * 2)
+		for ele in self.elements_2D:
+			d, (nd0, nd1, nd2) = ele.dict_node_to_index, ele.nodes
+			tups = ((nd0, d[nd0]), (nd1, d[nd1]), (nd2, d[nd2]))
+			for (nd1, i1), (nd2, i2) in product(tups, tups):
+				if (i:=nd1.i) <= (j:=nd2.i): #only consider diagonal and above
+					if ViVj_not_gradVigradVj: arr[i,j] += ele.arr_Vi_Vj_IntoverArea[i1,i2]
+					else: arr[i,j] += ele.arr_gradVi_gradVj_IntoverArea[i1,i2]
+		for i in range(n):
+			for j in range(n):
+				if i > j: arr[i,j] = arr[j,i]
+		return arr
 		
-	def textAllNodes(self, ax, *args, **kwargs):
-		for nd in self.nodes: ax.text(*nd.coor, nd.i, *args, **kwargs)
-
-
-
+	def getArr_Product_IntoverEdge_Linear(self, VigradVj_dot_normal_not_ViVj=False):
+		arr = np.zeros([len(self.nodes)] * 2)
+		for f, eg in ((next(iter(edge.faces)), edge) for edge in self.edges if len(edge.numFaces) == 1):
+			(nd1, nd2), d = eg.nodes, f.dict_node_to_index
+			if VigradVj_dot_normal_not_ViVj: arr_IntoverEdge = f.dict_edgeIdx_to_arr_Vi_gradVj_IntoverEdge[(d[nd1], d[nd2])]
+			else: arr_IntoverEdge = f.dict_edgeIdx_to_arr_Vi_Vj_IntoverEdge[(d[nd1], d[nd2])]
+			for nd1, nd2 in product(f.nodes, f.nodes): arr[nd1.i, nd2.i] += arr_IntoverEdge[d[nd1], d[nd2]]
+		return arr
+		
+		
 class Domain_3D:
 	def __init__(self):
-		self.nodes, self.edges, self.tups_eleNodes = [], [], []
-		self.arr_coors = None
-		self.elements_2D, self.elements_2D_active, self.elements_3D = [], [], []
-		self.domains_2D = []
-		
-		self.ithElement, self.buttons = 0, [] #For cycling through individual tetrahedrons
-		self.patches_activeFaces, self.texts_activeFaces = [], []
-		self.scatter_Nodes1, self.texts_Nodes1 = None, []
-		self.patches_elements, self.texts_elements = [], []
-		self.scatter_Nodes2, self.texts_Nodes2 = None, []
-		#self.scatter_nodes
+		self.nodes, self.edges = [], []
+		self.elements_2D, self.elements_3D = [], []
 		
 	def prepare4Mesh(self):
 		self.nodes, self.elements_2D = list(set(self.nodes)), list(set(self.elements_2D))
 		self.edges = list(set(self.edges))
 		for i, nd in enumerate(self.nodes): nd.i = i
-		#if not isinstance(faces, list): faces = list(faces)
-		for f in self.elements_2D: f.volumesMax = 1
-		self.elements_2D_active = self.elements_2D[:]
-		self.nodes = sorted(set(self.nodes), key=lambda nd: nd.i)
-		self.arr_coors = arr_coors = npA([nd.coor for nd in self.nodes])
-		print("\n\n\nBefore starting 3D meshing of domain. Faces must all be boundaries. Total faces: {}, active faces {}".format(len(self.elements_2D), len(self.elements_2D_active)))
-		print("All starting faces must have 1 volumesMax:", all(f.volumesMax == 1 for f in self.elements_2D_active), all(
-			f.volumesMax == 1 for f in self.elements_2D))
-		print("All nodes must correctly know the faces they have:", [(nd.i, len(nd.faces)) for nd in self.nodes])
-		print("Nodes: ", len(self.nodes))
-		print("Active faces:", self.elements_2D_active)
-	
-	def tetra_cuts_anyFace(self, coors4, excludeF=None):
-		c_new_cen = np.average(coors4, axis=0)
-		r = max(np.linalg.norm(coors4 - c_new_cen, axis=1))
-		ns_tetraFace = getNormals_OutofTetra(coors4)
-		return any(f is not excludeF and twoCoorsClose(c_new_cen, f.c_cen, r + f.radius) and \
-					verify_Triangle_cuts_Tetra(f.coors, coors4, f.ns_edge, f.normal, ns_tetraFace) for f in self.elements_2D)
-					
-	def getFaces_cutby_tetra(self, coors4, excludeF=None):
-		c_new_cen = np.average(coors4, axis=0)
-		r = max(np.linalg.norm(coors4 - c_new_cen, axis=1))
-		ns_tetraFace = getNormals_OutofTetra(coors4)
-		return [f for f in self.elements_2D if f is not excludeF and twoCoorsClose(c_new_cen, f.c_cen, r + f.radius) and
-				verify_Triangle_cuts_Tetra(f.coors, coors4, f.ns_edge, f.normal, ns_tetraFace)]
-				
-	def genTetrahedronEle_Wavefront(self, height, maxIter=10, maxNEle=0,
-									reportSummary=True, stopat1stFailure=True):
-		numIter = numEle = 0
-		stop = False
-		while faces := self.elements_2D_active:
-			if numIter >= maxIter: break
-			print("*******\nIteration %d\n********" % numIter)
-			print("Num of active faces", len(faces), len(self.elements_2D_active))
-			for face in faces[:]:
-				if face not in self.elements_2D_active: continue
-				print("\nTry to grow from active face", face)
-				if face.numVolumes >= face.volumesMax: raise Exception
-				n1, n2, n3 = ownNodes = face.nodes
-				c1, c2, c3 = n1.coor, n2.coor, n3.coor
-				node_new, nodes, c_cen, normal = None, self.nodes, face.c_cen, face.normal
-				# Check if there is a tetrahedron patch that closes void
-				node_new = self.search_4facesClosing(face)
-				#Check if this face has formed a 2-face closure
-				if not node_new: node_new = self.search_smallAnglebetween2Planes(face)
-				# If there is existing node that is very close and forms a large angle from the edge and won't cause intersection, then use it
-				if not node_new: node_new = self.search_nearbyNodes(face, height)
-				
+		for f in self.elements_2D:
+			if not f.volumes: f.volumesMax = 1
+			else: print("There is one face:", f, len(f.volumes), f.volumesMax)
+		print("\n\n\nBefore starting 3D meshing. Faces must all be boundaries. Total faces: {}".format(len(self.elements_2D)))
+		
+	def tetra_cuts_anyTri(self, coors4, cs_faces=None):
+		if cs_faces is None: cs_faces = npA([f.coors for f in self.elements_2D])
+		return check_Tetra_cuts_Tris(coors4, cs_faces)
+		
+	def getFaces_cutby_tetra(self, coors4, cs_faces):
+		faces = self.elements_2D
+		if cs_faces is None: cs_faces = npA([f.coors for f in faces])
+		return [faces[i] for i in check_Tetra_cuts_Tris(coors4, cs_faces, any_not_idx=False)]
+		
+	def genTetrahedronEle_Wavefront(self, func_height, maxIter=10):
+		numIter = 0
+		while (faces_active := [f for f in self.elements_2D if f.isActive]) and numIter < maxIter:
+			nds_curFront = {nd for ele in faces_active for nd in ele.nodes}
+			egs_curFront = {eg for ele in faces_active for eg in ele.edges}
+			print("*******\n3D Meshing Iteration %d\n********" % numIter)
+			#首先只从当前faces生成萌芽bud状的tetra
+			faces_active.sort(reverse=True, key=lambda tri: min(tri.d_nd_to_angles.values()))
+			for face in faces_active:
+				if not face.isActive: continue
+				print("\nTry to grow from active face", face, face.normal)
+				height = func_height(face.c_cen) if callable(func_height) else func_height
+				node_new = self.try_nearbyNodes(face, height, cs_faces := npA([f.coors for f in self.elements_2D]))
+				if not node_new: node_new = self.try_budEle_Height(face, height, cs_faces)[0]
 				if not node_new:
-					coors_tetra_new = npA([c1, c2, c3, c_new:= (c_cen + normal * height)])
-					if facesCut := self.getFaces_cutby_tetra(coors_tetra_new, excludeF=face):
-						nds_fromFacesCut = list({nd for ele in facesCut for nd in ele.nodes}-ownNodes)
-						print("New tetra would collide with", [f for f in facesCut])
-						print("Nodes of those cut faces", nds_fromFacesCut)
-						print("Potential new tetra:\n", (coors_tetra_new,))
-						arr_d_toFace = normal.dot((npA([nd.coor for nd in nds_fromFacesCut]) - c_cen).T).round(DIGIT_ACCU)
-						for i in arr_d_toFace.argsort():
-							if arr_d_toFace[i] <= 0: continue
-							nd0 = nds_fromFacesCut[i]
-							if not self.tetra_cuts_anyFace(npA([c1, c2, c3, nd0.coor]), excludeF=face):
-								print("Pick a node within the potential new tetra to form", nd0)
-								node_new = nd0; break
-					else:
-						node_new = Node(self, len(nodes), c_new)
-						print("Use the new node", node_new)
-				if node_new:
-					numEle += 1
-					self.elements_3D.append(ele:=Ele_Tetrahedron(self, [node_new, n1, n2, n3]))
-					print("Generate a tetrahedron", face, ele, "New ele volume:", ele.volume)
-					for f in ele.faces:
-						if f.numVolumes < f.volumesMax:
-							print("Attempt to span generated", f)
-							if node_new := self.search_4facesClosing(f):
-								print("-----\n   2ndary gen. Closing", f, node_new)
-								self.elements_3D.append(ele := Ele_Tetrahedron(self, [node_new, *f.nodes]))
-							elif node_new := self.search_smallAnglebetween2Planes(f):
-								print("-----\n2ndary gen. Small angle", f, node_new)
-								self.elements_3D.append(ele := Ele_Tetrahedron(self, [node_new, *f.nodes]))
-							elif node_new := self.search_nearbyNodes(f, height):
-								print("-----\n2ndary gen. Close node", f, node_new)
-								self.elements_3D.append(ele := Ele_Tetrahedron(self, [node_new, *f.nodes]))
-					if numEle >= maxNEle > 0: stop = True; break
-				else:
 					print("Failed to gen a tetra from face", face)
-					if stopat1stFailure: stop = True; break
-			if stop: break
+					raise RuntimeError
+				else:
+					ele = self.genaTetraElement([node_new, *face.nodes])
+					print("Genned a spiking tetra", ele, "with", node_new, ".  New ele volume:", ele.volume)
 			numIter += 1
 			
-		if reportSummary:
-			print("Number of elements_3D created:", len(self.elements_3D), "Total volume:", round(sum(ele.volume for ele in self.elements_3D), DIGIT_ACCU))
-			print("Nodes in domain: {}. Edges in domain: {}".format(len(self.nodes), len(self.edges)))
-			print("Total number of faces", len(self.elements_2D))
-			print("Boundary faces", sum(len(face.volumes) == 1 for face in self.elements_2D))
-			#print("Active faces left:", self.elements_2D_active)
+			#Try to close up the space around edges
+			for eg in egs_curFront:
+				if sum(f.isActive for f in eg.faces) == 2:
+					height = func_height(eg.c_cen) if callable(func_height) else func_height
+					print("\nTry to close up eg space", eg, [f for f in eg.faces if f.isActive], height)
+					self.try_closeupSpacearound_Eg(eg, height)
+			print("Remaining cur front edges:", [eg for eg in egs_curFront if sum(f.isActive for f in eg.faces) > 1])
+			
+			#Try to close up the space around nodes
+			for nd_cur in nds_curFront:
+				self.try_closeupSpacearound_nd(nd_cur)
+			
+		print("Finished meshing domain\nElements created:", len(self.elements_3D), "Total volume:", round(sum(ele.volume for ele in self.elements_3D), DIGIT_HEIGHT))
+		print("Nodes: {}. Edges: {}".format(len(self.nodes), len(self.edges)))
+		print("Active faces left:", sum(f.isActive for f in self.elements_2D))
 		
-	def search_4facesClosing(self, face):
-		nodes, normal, ownNodes, c_cen = self.nodes, face.normal, face.nodes, face.c_cen
-		nds_nextto_1, nds_nextto_2, nds_nextto_3 = [nd.nds_connectedbyEdge() for nd in ownNodes]
-		if nds_cmn := [nd for nd in nds_nextto_1.intersection(nds_nextto_2).intersection(nds_nextto_3) 
-					   if nd in nodes and {nd}|ownNodes not in self.tups_eleNodes]:
-			arr_d_toFace = normal.dot(npA([nd.coor - c_cen for nd in nds_cmn]).T)
-			if np.count_nonzero(arr_d_toFace > 0) > 1:
-				print("more than 1 possible closing")
-				print([(nd, d) for d, nd in zip(arr_d_toFace, nds_cmn)])
-			for i in arr_d_toFace.argsort():# There can be multiple nodes that can connect to both ends of edge. Pick the closest one in right direction
-				if arr_d_toFace[i] <= 0: continue
-				elif not self.tetra_cuts_anyFace(npA([*face.coors, nds_cmn[i].coor]), excludeF=face):
-					print("Use existing 4 nodes for tetra. Closing:", face, nds_cmn[i])
-					return nds_cmn[i]
-					
-	def search_smallAnglebetween2Planes(self, face):
-		c_cen, normal, ownNodes = face.c_cen, face.normal, face.nodes
-		if fs := [f for f in list(face.fs_connectedbyEdge())
-				  if normal.dot(f.c_cen - c_cen).round(DIGIT_ACCU) > 0 and normal.dot(f.normal) < 0.8]:
-			nds = [next(iter(f.nodes - ownNodes)) for f in fs]
-			arr_d_toFace = npA([normal.dot(nd.coor - c_cen) for nd in nds])
-			for i in arr_d_toFace.argsort():
-				print("Check if can gen using a two plane", face, nds[i])
-				if not self.tetra_cuts_anyFace(npA([*face.coors, (nd := nds[i]).coor]), excludeF=face):
-					print("Connect to another face's dot", face, nd)
-					return nd
+	def genaTetraElement(self, nodes):
+		if not isinstance(nodes, list): nodes = list(nodes)
+		self.elements_3D.append(ele := Ele_Tetrahedron(self, nodes))
+		return ele
 		
-	def search_nearbyNodes(self, face, height):
+	def try_closeupSpacearound_Eg(self, edge, height, maxAgnle_directClosing=100):
+		if fs := [f for f in edge.faces if f.isActive]:
+			while fs:
+				nd_other_2 = next(iter((f2 := fs[1]).nodes - (f1 := fs[0]).nodes))
+				largeAngle = f1.angle_withFace_deg(f2) > maxAgnle_directClosing
+				if not (node_new := self.try_budEle_Height(f1, height, npA([f.coors for f in self.elements_2D]),
+														   preferNode=None if largeAngle else nd_other_2)[0]):
+					print("Wrong while closing edge", edge)
+					raise RuntimeError
+				ele = self.genaTetraElement([node_new, *f1.nodes])
+				print("Genned a tetra ele {} while closing edge {}".format(ele, edge))
+				if fs := {f for f in edge.faces if f.isActive} - {f2}: fs = [f2, next(iter(fs))]
+				
+	def try_closeupSpacearound_nd(self, nd_cur, maxAngle_directClosing=90):
+		if not (faces := {f for f in nd_cur.faces if f.isActive}): return
+		if len(faces) != len({eg for f in faces for eg in f.edges} & nd_cur.edges): return
+		print("\nChecking nd_cur:", nd_cur)
+		
+		#Check if nd_cur has active faces that form a closed polehedral cone. If yes and a pair of neighboring triangles form small angle, close it.
+			#Loop until all such small angles are closed. If there are still active faces, pick the center of remaining nodes, and make all faces close toward this center
+		while faces:
+			nds_circ = {nd for f in faces for nd in f.nodes} - {nd_cur}
+			tups_f1_nd2_ndAngle = [] #For each edge connected to nd_cur, check if its two connected opening faces form small enough angles
+			for nd in nds_circ:
+				(f1, f2) = nd.faces & faces
+				nd1, nd2 = (f1.nodes | f2.nodes) - {nd_cur, nd}
+				ndAngle = 180 + (1 if f1.angle_withFace_deg(f2) < 180 else -1) * (-180 + angle_btw_2vecs(nd1.coor - nd.coor, nd2.coor - nd.coor))
+				tups_f1_nd2_ndAngle.append((f1, nd1 if nd2 in f1.nodes else nd2, ndAngle))
+			#Try closing the pair of faces that form smallest angles.
+				#After generating a closing tetra, finish if no more active faces left, otherwise start another loop
+			cs_faces, genSuccess = npA([f.coors for f in self.elements_2D]), False
+			for f1, nd2, angle in sorted(tups_f1_nd2_ndAngle, key=lambda t: t[2]):
+				if angle > maxAngle_directClosing: continue
+				if node_new := self.try_budEle_Height(f1, 0, cs_faces, preferNode=nd2)[0]:
+					ele, genSuccess = self.genaTetraElement([*f1.nodes, node_new]), True
+					print("Genned a tetra ele {} while closing node {}".format(ele, nd_cur))
+					break
+			
+			if not (faces := {f for f in nd_cur.faces if f.isActive}): break
+			elif not genSuccess:  # There is still opening faces, but they all form large angles.
+				#No more small angles between faces, now try converging towards center.
+				c_cen = np.average([nd.coor for nd in {nd for f in faces for nd in f.nodes} - {nd_cur}], axis=0)
+				print("Use center to create tetras", c_cen)
+				nd_cen, fs_preClosing = None, faces.copy()
+				while faces:
+					f, cs_faces = next(iter(faces & fs_preClosing)), npA([f.coors for f in self.elements_2D])
+					nd_cen, collided = self.try_budEle_Height(f, 0, cs_faces, preferNode=nd_cen, preferCoor=c_cen)
+					if not nd_cen: raise RuntimeError
+					ele = self.genaTetraElement((nd_cen, *f.nodes))
+					print("Genned a tetra ele {} while large space around closing node{}".format(ele, nd_cur))
+					if collided:
+						print("Closing large space around node {} encounters collision".format(nd_cur))
+						break
+					else: faces = {f for f in nd_cur.faces if f.isActive}
+	
+	def try_nearbyNodes(self, face, height, cs_faces,
+						lateral=0.52, vertical_min=0.5, vertical_max=1.2):
 		nodes, normal, c_cen, ownNodes = self.nodes, face.normal, face.c_cen, face.nodes
-		arr_d = np.linalg.norm(arr_vecs := npA([nd.coor for nd in nodes]) - c_cen, axis=1)
-		for i in arr_d.argsort():
-			if arr_d[i] > 1.6 * height: break
-			elif (nd := nodes[i]) in ownNodes: continue
-			elif normal.dot(arr_vecs[i]) > np.linalg.norm(arr_vecs[i]) / 4:
-				if not self.tetra_cuts_anyFace(npA([*face.coors, nd.coor]), excludeF=face):
-					print("Connect to a nearby node", face, nd)
-					return nd
-					
-	"""Visualize meshing"""
-	def plotAllEdges(self, ax, lw):
-		for edge in self.edges: ax.plot(*edge.coors.T, lw=lw)
-	
-	def plotEdgesofActiveFaces(self, ax, lw):
-		edges = {eg for f in self.elements_2D_active for eg in f.edges}
-		for eg in edges:
-			print("\t", eg, len(fs:=[f for f in eg.faces if f in self.elements_2D_active]), fs)
-		for eg in edges: ax.plot(*eg.coors.T, lw=lw)
+		vs_cen2Nodes = npA([nd.coor for nd in nodes]) - c_cen  # shape(n, 3)
+		heights_fromface, horDist_fromCen = (normal @ vs_cen2Nodes.T).round(DIGIT_HEIGHT), npNorm(np.cross(normal, vs_cen2Nodes), axis=1)
+		dist_fromCen, maxHorDist = npNorm(vs_cen2Nodes, axis=1), lateral * height
+		idx_allowed = np.where((vertical_min * height < heights_fromface) & (heights_fromface < vertical_max * height) & (horDist_fromCen < maxHorDist))[0]
+		nodes_ds = sorted(((nodes[i], dist_fromCen[i]) for i in idx_allowed), key=lambda tup: tup[1])
+		return next((nd for nd, _ in nodes_ds if not self.tetra_cuts_anyTri(npA([*face.coors, nd.coor]), cs_faces)), None)
 		
-	def plotAllActiveFaces(self, fig, ax, alpha=0.15, size=8):
-		self.scatter_Nodes1 = ax.scatter(*npA([nd.coor for nd in self.nodes]).T)
-		for nd in self.nodes:
-			self.texts_Nodes1.append(txt:=ax.text(*nd.coor, nd.i))
-			txt.node = nd
-		fig.canvas.mpl_connect("button_press_event", lambda event: self.mouseClicked_onFaceActive(ax, event))
-		for i, ele in enumerate(self.elements_2D_active):
-			self.plotActiveFace(ax, i, ele)
-			#ax.quiver(*ele.c_cen, *ele.normal)
-			
-	def plotActiveFace(self, ax, i, ele, alpha=0.15, size=8):
-		cm = plt.cm.get_cmap('rainbow')
-		patch = ax_plotPolygons(ax, [ele.coors], alpha=alpha, color=cm(np.random.uniform()))
-		txt = ax.text(*np.average(ele.coors, axis=0), i, size=size, horizontalalignment="center", verticalalignment="center")
-		patch.element = txt.element = ele
-		self.patches_activeFaces.append(patch)
-		self.texts_activeFaces.append(txt)
-	
-	def update_activeFaces(self, ax):
-		self.scatter_Nodes1._offsets3d = npA([nd.coor for nd in self.nodes]).T
-		for patch, text in zip(self.patches_activeFaces[:], self.texts_activeFaces[:]):
-			if patch.element not in self.elements_2D_active:
-				self.patches_activeFaces.remove(patch)
-				self.texts_activeFaces.remove(text)
-				patch.remove()
-				text.remove()
-			text.set_text(text.element.numVolumes)
-		for nd in self.nodes:
-			if not any(txt.node is nd for txt in self.texts_Nodes1):
-				self.texts_Nodes1.append(txt := ax.text(*nd.coor, nd.i))
-				txt.node = nd
-		for i, ele in enumerate(self.elements_2D_active):
-			if not any(patch.element is ele for patch in self.patches_activeFaces):
-				self.plotActiveFace(ax, ele.numVolumes, ele)
-				
-	def mouseClicked_onFaceActive(self, ax, event):
-		if event.inaxes == ax and (patch := next((patch for patch in self.patches_activeFaces if patch.contains(event)[0]), None)):
-			ele = patch.element
-			print("Triangle:", ele, (ele.coors,))
-			
-	def plotAllElements(self, ax, size=8, explosionCenter=None, explosionFactor=0.2):
-		self.scatter_Nodes2 = ax.scatter(*npA([nd.coor for nd in self.nodes]).T)
-		for nd in self.nodes:
-			self.texts_Nodes2.append(txt:=ax.text(*nd.coor, nd.i))
-			txt.node = nd
-		for i, ele in enumerate(self.elements_3D):
-			self.plotElement(ax, i, ele, explosionCenter=explosionCenter, explosionFactor=explosionFactor)
-			
-	def plotElement(self, ax, i, ele, explosionCenter=None, explosionFactor=0.2, alpha=0.15, size=8):
-		cm = plt.cm.get_cmap('rainbow')
-		offset = np.zeros((3, )) if explosionCenter is None else explosionFactor * (ele.c_cen-explosionCenter)
-		patch = ax_plotPolygons(ax, [offset+f.coors for f in ele.faces], alpha=0.15, color="green")
-		txt = ax.text(*ele.c_cen, i, size=size, color="red",
-					  verticalalignment="center", horizontalalignment="center")
-		self.patches_elements.append(patch)
-		self.texts_elements.append(txt)
-		patch.element = txt.element = ele
+	def try_budEle_Height(self, face, height, cs_faces, preferNode=None, preferCoor=None,
+							largerHeight_2Try=1.2):
+		nodes, normal, ownNodes, c_cen = self.nodes, face.normal, face.nodes, face.c_cen
+		c1, c2, c3 = face.coors
 		
-	def update_elements(self, ax, explosionCenter=None, explosionFactor=0.2):
-		self.scatter_Nodes2._offsets3d = npA([nd.coor for nd in self.nodes]).T
-		for patch, text in zip(self.patches_elements[:], self.texts_elements[:]):
-			if patch.element not in self.elements_3D:
-				self.patches_elements.remove(patch)
-				self.texts_elements.remove(text)
-				patch.remove()
-				text.remove()
-		for nd in self.nodes:
-			if not any(txt.node is nd for txt in self.texts_Nodes2):
-				self.texts_Nodes2.append(txt := ax.text(*nd.coor, nd.i))
-				txt.node = nd
-		for i, ele in enumerate(self.elements_3D):
-			if not any(patch.element is ele for patch in self.patches_elements):
-				self.plotElement(ax, i, ele, explosionCenter=explosionCenter, explosionFactor=explosionFactor)
-				
-	def prepare_to_viewIndividual(self, ax):
-		polyCol = ax_plotPolygons(ax, [], alpha=0.4, color="green")
-		(b_last := Button(ax=plt.axes([0.02, 0.2, 0.12, 0.04]), label="Last", hovercolor="0.95")).on_clicked(lambda event: self.newEletoView(ax, polyCol, -1))
-		(b_next := Button(ax=plt.axes([0.02, 0.25, 0.12, 0.04]), label="Next", hovercolor="0.95")).on_clicked(lambda event: self.newEletoView(ax, polyCol, 1))
-		self.buttons += [b_last, b_next]
-		
-	def newEletoView(self, ax, polyCol, incre):
-		self.ithElement += incre
-		ele = self.elements_3D[self.ithElement % len(self.elements_3D)]
-		# print("View element", ele, ele.faces)
-		polyCol.set_verts([f.coors for f in ele.faces])
-	
-	def saveMesh(self, filename="Mesh.txt"):
+		if preferNode and preferNode in face.nodes:
+			print(face, preferNode)
+			raise ValueError
+		if preferNode: cs_tetra_new = npA([c1, c2, c3, preferNode.coor])
+		elif preferCoor is None: cs_tetra_new = npA([c1, c2, c3, c_cen + largerHeight_2Try * normal * height])
+		else: cs_tetra_new = npA([c1, c2, c3, preferCoor])
+		#欲生成新四面体，需要先检测其是否与已有faces相重叠。如没有，则可以直接生成，如果有，则找到所有有重叠的face
+		if facesCut := self.getFaces_cutby_tetra(cs_tetra_new, cs_faces):
+			nds_fromFacesCut = list({nd for ele in facesCut for nd in ele.nodes} - ownNodes)
+			vs_cen_to_nds = npA([nd.coor for nd in nds_fromFacesCut]) - c_cen
+			angles_from_normal = np.degrees(np.arccos(normal.dot(vs_cen_to_nds.T) / npNorm(vs_cen_to_nds, axis=1))).round(1)
+			nds_angles = sorted(zip(nds_fromFacesCut, angles_from_normal), key=lambda t: t[1])
+			return next((nd for nd, angle in nds_angles if angle < 90 and not self.tetra_cuts_anyTri(npA([c1, c2, c3, nd.coor]), cs_faces)), None), True
+		elif preferNode:
+			print("Bud with existing node", preferNode)
+			return preferNode, False
+		else:
+			print("Bud with new node")
+			return Node(self, len(nodes), (c_cen+normal*height) if preferCoor is None else preferCoor), False
+
+	"""
+	Save and load mesh for FEA solution.
+	"""
+	def saveMesh(self, filename="3D_Mesh.txt"):
 		with open(filename, 'w') as fout:
 			fout.write("Nodes:\n")
-			for nd in self.nodes: fout.write("{},{}\n".format(nd.i, nd.coor))
+			for nd in self.nodes:
+				fout.write("{}, [{},{},{}]\n".format(nd.i, *nd.coor.round(DIGIT_HEIGHT)))
 			fout.write("Volumes:\n")
 			for volume in self.elements_3D:
 				n1, n2, n3, n4 = volume.nodes
 				fout.write("{},{},{},{}\n".format(n1.i, n2.i, n3.i, n4.i))
+				
+	def loadMesh(self, filename="3D_Mesh.txt"):
+		with open(filename, 'r') as fin:
+			i = (lines := fin.readlines()).index("Volumes:\n")
+			lines_nodes, lines_volumes = lines[1:i], lines[i + 1:]
+			nodes, elements_3D = self.nodes, self.elements_3D = [], []
+			
+			for i, l in enumerate(lines_nodes):
+				exec("Node(self, {}, np.array({}))".format(i, l[l.index(',') + 1:].strip("\n")))
+			print("Nodes in mesh:\n", nodes)
+			for l in lines_volumes:
+				i0, i1, i2, i3 = l.strip("\n").split(',')
+				i0, i1, i2, i3 = int(i0), int(i1), int(i2), int(i3)
+				elements_3D.append(Ele_Tetrahedron(self, [nodes[i0], nodes[i1], nodes[i2], nodes[i3]], calcFEAMatrices=True))
+			print("Volumes in mesh:\n", elements_3D)
+	
+	"""Calculate matrices neccesary for FEA."""
+	def getArr_scalarProducts_IntoverVolume_Linear(self, ViVj_not_gradVigradVj=False):
+		arr = np.zeros([n := len(self.nodes)] * 2)
+		for ele in self.elements_3D:
+			d, (nd0, nd1, nd2, nd3) = ele.dict_node_to_index, ele.nodes
+			tups = ((nd0, d[nd0]), (nd1, d[nd1]), (nd2, d[nd2]), (nd3, d[nd3]))
+			for (nd1, i1), (nd2, i2) in product(tups, tups): #4x4 pairs of ij
+				if (i := nd1.i) <= (j := nd2.i):  # only consider diagonal and above
+					if ViVj_not_gradVigradVj: arr[i, j] += ele.arr_Vi_Vj_IntoverVolume[i1, i2]
+					else: arr[i, j] += ele.arr_gradVi_gradVj_IntoverVolume[i1, i2]
+		for i in range(n):
+			for j in range(n):
+				if i > j: arr[i, j] = arr[j, i]
+		return arr
+		
+	def getArr_Product_IntoverFace_Linear(self, VigradVj_dot_normal_not_ViVj=False):
+		arr = np.zeros([len(self.nodes)] * 2)
+		for vol, f in ((next(iter(face.volumes)), face) for face in self.elements_2D if len(face.volumes) == 1):
+			(nd1, nd2, nd3), d = f.nodes, vol.dict_node_to_index
+			if VigradVj_dot_normal_not_ViVj: arr_IntoverEdge = vol.dict_faceIdx_to_arr_Vi_gradVj_IntoverFace[(d[nd1], d[nd2], d[nd3])]
+			else: arr_IntoverEdge = vol.dict_faceIdx_to_arr_Vi_Vj_IntoverFace[(d[nd1], d[nd2], d[nd3])]
+			for nd1, nd2 in product(f.nodes, f.nodes): arr[nd1.i, nd2.i] += arr_IntoverEdge[d[nd1], d[nd2]]
+		return arr
+	
+	
+def create3DDomain_init2DBoundaries(ls_polies, height):
+	domain_3D = Domain_3D()
+
+	nodes_total = sorted((Node(domain_3D, pt.i, pt.coor) for pt in {pt for poly in ls_polies for pt in poly.pts_split}), key=lambda nd: nd.i)
+	ls_edges, ls_nodes = [], [[nodes_total[pt.i] for pt in poly.pts_split] for poly in ls_polies]
+	
+	for poly in ls_polies:
+		pts, edges_poly = poly.pts_split, []
+		for pt1, pt2 in zip(pts, pts[1:] + [pts[0]]):
+			nd1, nd2 = nodes_total[pt1.i], nodes_total[pt2.i]
+			if egShared := nd1.edgeSharedwith(nd2): edges_poly.append(egShared)
+			else: edges_poly.append(Edge(domain_3D, nd1, nd2))
+		ls_edges.append(edges_poly)
+
+	ls_domains_2D, dict_egBoundary_tofaces = [], {}
+	for nodes, edges, poly in zip(ls_nodes, ls_edges, ls_polies):
+		n_edges, n_face = poly.n_edges, poly.normal
+		for edge, n_edge in zip(edges, n_edges): edge.normal = n_edge
+		
+		domain_2D = Domain_2D()
+		domain_2D.prepare4Mesh(edges, nodes)
+		try:
+			domain_2D.genTriangleEle_Wavefront(height, maxIter=5)
+		except Exception as e: print("Error.", e)
+		domain_2D.dissolveSmallTriangles(height)
+		for face in domain_2D.elements_2D: face.normal = n_face
+		domain_3D.elements_2D += domain_2D.elements_2D
+		for eg in edges:
+			if eg in dict_egBoundary_tofaces: dict_egBoundary_tofaces[eg] |= eg.faces
+			else: dict_egBoundary_tofaces[eg] = eg.faces.copy()
+			eg.faces = set()
+		ls_domains_2D.append(domain_2D)
+		
+	for eg, faces in dict_egBoundary_tofaces.items(): eg.faces = faces
+	domain_3D.nodes = list({nd for domain_2D in ls_domains_2D for nd in domain_2D.nodes})
+	domain_3D.edges = list({edge for domain_2D in ls_domains_2D for edge in domain_2D.edges})
+	return domain_3D, ls_domains_2D
