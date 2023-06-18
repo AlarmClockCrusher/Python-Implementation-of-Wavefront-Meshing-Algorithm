@@ -39,7 +39,7 @@ def addModel_2collection(obj_name, coords, edges=[], faces=[], showName=False):
     obj.select_set(state=True)
     bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='MEDIAN')
     obj.select_set(state=False)
-        
+    
 
 with open(os.path.join(root, "Saved_Domain_3D.pkl"), "rb") as f:
     cs_tetras, idx_tetras, ndCoors_idx = pickle.load(f)
@@ -50,9 +50,8 @@ for cs_tetra, idx in zip(cs_tetras, idx_tetras):
     name = "Tetra-"+'-'.join(str(i) for i in sorted(idx))
     addModel_2collection(name, cs_tetra, faces=idx_4choose3, showName=False)
     
-#for c, i in ndCoors_idx:
-#    addModel_2collection(str(i), [c], showName=True)
-    #addText_2Blender(str(i), location=c)
+for c, i in ndCoors_idx:
+    addModel_2collection(str(i), [c], showName=True)
     
 for obj in bpy.data.objects:
     if obj.type == 'FONT': obj.name = obj.data.body[:10]
